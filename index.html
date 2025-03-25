@@ -1,0 +1,1053 @@
+<html>
+<head>
+    <script type="x-shader/x-fragment" id="shader-common-fs" src="util/fs">
+        #define I iFrame
+        #define delta min(iTimeDelta*3., 3./30.)
+        #define M iMouse
+        #define channel iChannel0
+        
+        #define T(uv) texelFetch(iChannel0, uv, 0)
+        #define F(uv, channel) texelFetch(channel, uv, 0)
+        #define A(U) texture(iChannel0, U/R)
+        
+        #define U2i(U) int(floor(clamp(floor(U.x) + floor(U.y) * R.x, 0., R.x*R.y)));
+        
+        #define pos(i, channel)  F(ivec2(i, 0), channel).xy
+        #define vel(i, channel)  F(ivec2(i, 0), channel).zw
+        #define axes(i, channel) F(ivec2(i, 0), channel).xyz
+        
+        #define mid(start, i, j) ((pos(start+i, channel) + pos(start+j, channel)) / 2.)
+        
+        #define YMAX 2.0
+        #define XMAX (R.x/R.y*YMAX)
+        
+        #define ARM_RIGHT_TARGET mid(BODY_START, 0, 1)
+        #define ARM_LEFT_TARGET mid(BODY_START, 9, 10)
+        #define ARM_LENGTH 0.25
+        
+        #define BODY_START 0
+        #define HEAD_START (N+2)
+        #define ARM_RIGHT HEAD_START+H
+        #define ARM_LEFT ARM_RIGHT+1
+        
+        #define in_body(i) (i >= BODY_START && i < BODY_START+N)
+        #define in_b2h(i) (i == BODY_START + N)
+        #define in_h2b(i) (i == BODY_START + N+1)
+        #define in_head(i) (i >= HEAD_START && i < HEAD_START+H)
+        #define in_armr(i) (i == ARM_RIGHT)
+        #define in_arml(i) (i == ARM_LEFT)
+        
+        #define body_i(i) (i - BODY_START)
+        #define head_i(i) (i - HEAD_START)
+        
+        #define HEAD_RADIUS() (3.7 - 0.9*abs(sin(norm(i)*TAU)))
+        #define BODY_RADIUS() min(1.3 - 1.1*abs(cos(norm(i)*TAU)), 0.6)
+         
+        #define STRING_REST 0.03
+        
+        const float BODY_PRES = 66.;
+        const float HEAD_PRES = 8.;
+        
+        const float HEAD_MASS = 0.8;
+        const float BODY_MASS = 1.;
+        
+        const float KS = 755.;
+        const float KD = 35.;
+        
+        const float r = 0.005;
+        const vec2 G = vec2(0, -1.2);
+        const float TAU = 6.283185;
+        const float PI = TAU/2.;
+        
+        const int N = 20;
+        const int H = N;
+        
+        const float INITIAL_RADIUS = .2;
+        
+        vec2 avg(in vec2[N] arr) {
+            vec2 acc = vec2(0);
+            for (int i = 0; i < N; i ++) acc += arr[i];
+            return acc / float(N);
+        }
+        
+        vec2 to_world_space(vec2 p, vec2 R) {
+            return ((p - R / 2.) / R.y) * 2. * YMAX;
+        }
+        
+        vec2 to_screen_space(vec2 p, vec2 R) {
+            return (((p / YMAX) / 2.) * R.y + R / 2.);
+        }
+        
+        float norm(int i) {
+            return float(i)/float(N);
+        }
+        
+        int prev(int i) {
+            return i == 0 ? N-1 : i-1;
+        }
+        
+        int next(int i) {
+            return i == N-1 ? 0 : i+1;
+        }
+        
+        float cross2(vec2 a, vec2 b){
+            return a.x * b.y - a.y * b.x;
+        }
+        
+        mat3 transform(vec2 pos, float a) {
+            return mat3(
+                cos(a),-sin(a), 0,
+                sin(a), cos(a), 0,
+                pos.x , pos.y , 1);
+        }
+        
+        mat3 transform(vec2 pos, vec2 x) {
+            return mat3(
+                x.x   ,-x.y   , 0,
+                x.y   , x.x   , 0,
+                pos.x , pos.y , 1);
+        }
+        
+        mat3 transform(vec3 axes) {
+            return transform(axes.xy, axes.z);
+        }
+        
+        // Trapezoid rule
+        float area(in vec2[N] points) {
+            float area = 0.;
+            vec2 a = points[0], b;
+            for (int i = 1; i < N; i++) {
+                b = points[i];
+                float h = a.y + b.y;
+                // points are ccw; negative width = positive area
+                float w = a.x - b.x;
+                area += (w*h)/2.;
+                a = b;
+            }
+            return area;
+        }
+        
+        // Average of all positions
+        vec2 center(in vec2[N] points) {
+            vec2 sum = vec2(0.);
+            for (int i = 0; i < N; i++) {
+                sum += points[i];
+            }
+            return sum / float(N);
+        }
+        
+        vec2 center(int start, sampler2D channel) {
+            vec2 sum = vec2(0.);
+            for (int i = 0; i < N; i++) {
+                sum += pos(start+i, channel);
+            }
+            return sum / float(N);
+        }
+        
+        vec2[N] positions(int start, sampler2D channel) {
+            vec2[N] o;
+            for (int i = start; i < start + N; i++) {
+                o[i-start] = pos(i, channel);
+            }
+            return o;
+        }
+        
+        vec2[N] velocities(int start, sampler2D channel) {
+            vec2[N] o;
+            for (int i = start; i < start + N; i++) {
+                o[i-start] = vel(i, channel);
+            }
+            return o;
+        }
+        
+        vec2 spring_force(int i, int j, in vec2[N] points, in vec2[N] vels, float rest) {
+            vec2 p1 = points[i];
+            vec2 p2 = points[j];
+            float r12d = length(p1 - p2);
+            if (r12d != 0.)
+            {
+                float f = (r12d - rest) * KS + dot(vels[i] - vels[j], p1 - p2) * KD / r12d;
+                return -(p1 - p2) / r12d * f;
+            } else 
+                return vec2(0);
+        }
+        
+        vec2 volume_force(int i, in vec2[N] points, float pressure) {
+            float area = area(points);
+            area = .5 * abs(area);
+            
+            vec2 n = points[prev(i)] - points[next(i)];
+            n = vec2(-n.y, n.x);
+                
+            return n * pressure / area;
+        }
+        
+        vec2 joint_force(vec2 p, mat3 t, mat3 jt, float mass) {
+            vec2 target = (jt * inverse(t) * vec3(p, 1)).xy;
+            float d = distance(target, p);
+            d = clamp(d, 0., 0.5);
+            return (target - p) * (exp(d)-1.) * 100. / mass;
+        }
+        
+        vec2 stand_force(vec2 p, mat3 t, vec2 center) {
+            mat3 jt = 
+            //-
+            transform(vec3(t[2][0], t[2][1], 0.));
+            vec2 target = (jt * inverse(t) * vec3(p, 1)).xy;
+            float d = distance(p, center);
+            d = clamp(d, 0., 0.5);
+            return (target - p) * d * 50.;
+        }
+        
+        vec2 mouse_force(vec2 p, vec4 mouse, mat3 t, float mass, vec2 center, vec2 R) {
+            if(mouse.z > .5) { 
+                vec2 target = to_world_space(mouse.xy, R);
+                float d = distance(target, p);
+                d = clamp(d, 0., .3);
+                return exp(d*5.) * 10. * (target - center) + stand_force(p, t, center);
+            } else return vec2(0, 0);
+        }
+        
+        void floor_collisions(inout vec4 Q, vec2 R) {
+            vec2 p = Q.xy;
+            if (p.y != clamp(p.y, -YMAX, YMAX)) {
+                Q.y = clamp(p.y, -YMAX, YMAX);
+                Q.zw *= vec2(0.9, -0.1);
+            }
+            if (p.x != clamp(p.x, -XMAX, XMAX)) {
+                Q.x = clamp(p.x, -XMAX, XMAX);
+                Q.zw *= vec2(-0.1, 0.9);
+            }
+        }
+        
+        #define MAX_FORCE 100.
+        #define MAX_VEL 10.
+        #define MIN_VEL 5e-3
+        void integrate_forces(inout vec4 Q, vec2 F, float dt) {
+            if (length(F) > MAX_FORCE) {
+                F = normalize(F) * MAX_FORCE;
+            }
+        
+            vec2 a = F;
+            vec2 v = Q.zw = Q.zw + a * 0.3 * dt;
+            if (length(Q.zw) > MAX_VEL) {
+                Q.zw = normalize(Q.zw) * MAX_VEL;
+            }
+            if (length(Q.zw) < MIN_VEL) {
+                Q.zw = vec2(0);
+            }
+            vec2 p = Q.xy = Q.xy + v * 0.3 * dt;
+        }
+        
+        void velocity_damping(inout vec4 Q, float dt, vec2 jvel, vec2 jdir, vec2 mdir) {
+            // Regular damping
+            Q.zw = Q.zw * (1. - (0.2 * dt));
+            // Joint damping (inspired by https://lisyarus.github.io/blog/posts/soft-body-physics.html)
+            float jrel = dot(Q.zw - jvel, jdir);
+            if (length(jdir) > 0.) Q.zw = Q.zw - (jdir * jrel * (1.5 * dt));
+            // Mouse damping
+            float mrel = dot(Q.zw, mdir);
+            if (length(mdir) > 0.) Q.zw = Q.zw - (mdir * mrel * (1.0 * dt));
+        
+        }
+        
+        vec2 forces(
+            int i, 
+            float radius,
+            float pressure,
+            in vec2[N] points,
+            in vec2[N] vels) {
+            vec2 F = vec2(0);
+            
+            F += spring_force(i, prev(i), points, vels, STRING_REST);
+            F += spring_force(i, next(i), points, vels, STRING_REST);
+            
+            F += volume_force(i, points, pressure) * radius;
+            return F;
+        }
+        
+        #define DISTANCE_THRESHOLD 0.2
+        #define INTEGRATE_TEMPLATE(START, JSTART, J, K, RADIUS, PRES, MASS, stand) ( \
+            inout vec4 Q, \
+            int i, \
+            float dt, \
+            vec2 R, \
+            vec4 M, \
+            sampler2D channel) { \
+            vec2[N] vels = velocities(START, channel), \
+                    points = positions(START, channel); \
+            vec2 jvel = avg(velocities(JSTART, channel)); \
+            vec2 center = center(points); \
+            vec2 F = forces(i, RADIUS, PRES, points, vels); \
+            mat3 t = transform(axes(J, channel)); \
+            mat3 jt = transform(axes(K, channel)); \
+            vec2 jf, mf; \
+            F += jf = joint_force(Q.xy, t, jt, MASS); \
+            F += mf = mouse_force(Q.xy, M, t, MASS, center, R); \
+            F = F/3.; \
+            if (!stand || length(F) > 1.) F += G * MASS; \
+            integrate_forces(Q, F, dt); \
+            velocity_damping(Q, dt, jvel, normalize(jf), normalize(mf)); \
+            floor_collisions(Q, R); \
+        }
+        
+        void integrate_body INTEGRATE_TEMPLATE(BODY_START, HEAD_START, N, N+1, BODY_RADIUS(), BODY_PRES, BODY_MASS, false)
+        void integrate_head INTEGRATE_TEMPLATE(HEAD_START, BODY_START, N+1, N, HEAD_RADIUS(), HEAD_PRES, HEAD_MASS, true)
+        
+        #define UPDATE_JOINT_TEMPLATE(START, OFFSET) ( \
+            inout vec4 Q, \
+            sampler2D channel) { \
+            vec2[N] points = positions(START, channel); \
+            vec2 center = center(points); \
+            Q.xy = center; \
+            vec2 left = normalize(points[0] - Q.xy); \
+            Q.z = -atan(left.y, left.x); \
+            Q.xy += OFFSET; \
+        }
+        
+        void update_joint_b2h UPDATE_JOINT_TEMPLATE(BODY_START, points[5] - center) 
+        void update_joint_h2b UPDATE_JOINT_TEMPLATE(HEAD_START, vec2(0, 0)) 
+            
+        const float ARM_MASS = 5.;
+        void update_arm(inout vec4 Q, vec2 t, float dt, sampler2D channel) {
+            integrate_forces(Q, G*ARM_MASS, dt);
+            vec2 n = normalize(Q.xy - t);
+            vec2 s = vec2(-n.y, n.x);
+            Q.xy = t+n*ARM_LENGTH;
+            Q.zw = s*dot(s,Q.zw);
+            // Regular damping
+            Q.zw = Q.zw * (1. - (0.5 * dt));
+        }        
+    </script>
+
+    <script type="x-shader/x-fragment" id="shader-abuf-fs" src="util/fs">
+        #define R iResolution.xy
+    
+        void mainImage( out vec4 Q, in vec2 U ) {
+    
+            int i = U2i(U);
+            bool body = in_body(i), head = in_head(i);
+            
+            if (I < 1) {
+                if (!body && !head) { 
+                    Q = vec4(0);
+                    return;
+                } 
+                
+                if (body) { 
+                    i = body_i(i); 
+                    Q = vec4(0, 0, 1, 0.5);
+                }
+                if (head) { 
+                    i = head_i(i);
+                    Q = vec4(0, 0, 1, 0.5);
+                }
+                
+                float rad = norm(i)*TAU;
+                Q.y += sin(rad) * INITIAL_RADIUS;
+                Q.x += cos(rad) * INITIAL_RADIUS;
+                
+                return;
+            } else
+                Q = A(U);
+            
+            bool b2h = in_b2h(i), h2b = in_h2b(i);
+            bool armr = in_armr(i), arml = in_arml(i);
+            
+            if (body) {
+                i = body_i(i);
+                integrate_body(Q, i, delta, R, M, iChannel0);
+            } else if (head) {
+                i = head_i(i);
+                integrate_head(Q, i, delta, R, M, iChannel0);
+            } else if (b2h) {
+                update_joint_b2h(Q, iChannel0);
+            } else if (h2b) {
+                update_joint_h2b(Q, iChannel0);
+            } else if (armr) {
+                update_arm(Q, ARM_RIGHT_TARGET, delta, iChannel0);
+            } else if (arml) {
+                update_arm(Q, ARM_LEFT_TARGET, delta, iChannel0);
+            }
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="shader-bbuf-fs" src="util/fs">
+    #define R iResolution.xy
+    
+    void mainImage( out vec4 Q, in vec2 U ) {
+
+        int i = U2i(U);
+
+        bool body = in_body(i), head = in_head(i);
+            
+            if (I < 1) {
+                if (!body && !head) { 
+                    Q = vec4(0);
+                    return;
+                } 
+                
+                if (body) { 
+                    i = body_i(i); 
+                    Q = vec4(0, 0, 1, 0.5);
+                }
+                if (head) { 
+                    i = head_i(i);
+                    Q = vec4(0, 0, 1, 0.5);
+                }
+                
+                float rad = norm(i)*TAU;
+                Q.y += sin(rad) * INITIAL_RADIUS;
+                Q.x += cos(rad) * INITIAL_RADIUS;
+                
+                return;
+            } else
+                Q = A(U);
+        
+        bool b2h = in_b2h(i), h2b = in_h2b(i);
+    
+        Q = A(U);
+        
+        if (body) {
+            i = body_i(i);
+            integrate_body(Q, i, delta, R, M, iChannel0);
+        } else if (head) {
+            i = head_i(i);
+            integrate_head(Q, i, delta, R, M, iChannel0);
+        } else if (b2h) {
+            update_joint_b2h(Q, iChannel0);
+        } else if (h2b) {
+            update_joint_h2b(Q, iChannel0);
+        }
+    }
+    </script>
+    
+    <script type="x-shader/x-fragment" id="shader-screen-fs" src="util/fs">
+        #define R iResolution.xy
+        #define cpos(i) pos(i, iChannel0)
+        #define caxes(i) axes(i, iChannel0)
+        
+        #define sq(x) (x)*(x)
+        
+        const vec3 BODY_COLOR = vec3(150, 203, 200)/250.;
+        const vec3 HEAD_COLOR = vec3(1);
+        const vec3 SHELL_COLOR = vec3(247, 235, 177)/250.;
+        const vec3 BLUE_COLOR = vec3(107, 121, 159)/250.;
+        const vec3 NOSE_COLOR = vec3(177, 130, 64)/250.;
+        const vec3 BODY_SHADOW_COLOR = vec3(105, 160, 174)/250.;
+        const vec3 HEAD_SHADOW_COLOR = vec3(168, 180, 202)/250.;
+        const vec3 SHELL_SHADOW_COLOR = vec3(174, 178, 151)/250.;
+        const vec3 BLUE_SHADOW_COLOR = vec3(66, 90, 136)/250.;
+        const vec3 NOSE_SHADOW_COLOR = vec3(134, 105, 59)/250.;
+        const vec3 BODY_BORDER_COLOR = BODY_SHADOW_COLOR * 0.5;
+        const vec3 HEAD_BORDER_COLOR = HEAD_SHADOW_COLOR * 0.5;
+        const vec3 SHELL_BORDER_COLOR = SHELL_SHADOW_COLOR * 0.5;
+        const vec3 BLUE_BORDER_COLOR = BLUE_SHADOW_COLOR * 0.5;
+        const vec3 NOSE_BORDER_COLOR = NOSE_SHADOW_COLOR * 0.5;
+        const vec3 BODY_SHADOW_LIGHT_COLOR = vec3(127, 179, 186)/250.;
+        const vec3 HEAD_SHADOW_LIGHT_COLOR = vec3(217, 222, 233)/250.;
+        const vec3 SHELL_SHADOW_LIGHT_COLOR = vec3(215, 210, 165)/250.;
+        const vec3 BLUE_SHADOW_LIGHT_COLOR = vec3(86, 107, 151)/250.;
+        const vec3 NOSE_SHADOW_LIGHT_COLOR = vec3(165, 121, 61)/250.;
+        const vec3 EYES_COLOR = vec3(54, 51, 50)/250.;
+        
+        // SDF Utilities from https://www.ronja-tutorials.com/post/035-2d-sdf-combination/
+        float merge(float shape1, float shape2){
+            return min(shape1, shape2);
+        }
+        
+        float intersect(float shape1, float shape2){
+            return max(shape1, shape2);
+        }
+        
+        float round_merge(float shape1, float shape2, float radius){
+            vec2 intersectionSpace = vec2(shape1 - radius, shape2 - radius);
+            intersectionSpace = min(intersectionSpace, 0.);
+            float insideDistance = -length(intersectionSpace);
+            float simpleUnion = merge(shape1, shape2);
+            float outsideDistance = max(simpleUnion, radius);
+            return  insideDistance + outsideDistance;
+        }
+        
+        void draw_debug_point(inout vec4 Q, vec2 U, vec2 p, vec3 color) {
+            float l = length(U - p)/R.x;
+            Q.rgb = mix(Q.rgb, color, smoothstep(0.01+r, 0.01, l));
+        }
+        
+        #define DEBUG_AXES_LEN 0.1
+        void draw_debug_axes(inout vec4 Q, vec2 U, int i) {
+            vec3 a = caxes(i).xyz;
+            mat3 t = transform(a);
+            
+            vec2 p = to_screen_space(a.xy, R);
+            draw_debug_point(Q, U, p, vec3(1));
+            vec2 x = (t * vec3(DEBUG_AXES_LEN, 0, 1)).xy;
+            x = to_screen_space(x, R);
+            draw_debug_point(Q, U, x, vec3(1, 0, 0));
+            vec2 y = (t * vec3(0, DEBUG_AXES_LEN, 1)).xy;
+            y = to_screen_space(y, R);
+            draw_debug_point(Q, U, y, vec3(0, 1, 0));
+        }
+        
+        void draw_debug_index(inout vec4 Q, vec2 U, int i) {
+            vec2 p = to_screen_space(cpos(i), R);
+            draw_debug_point(Q, U, p, vec3(1));
+        }
+        
+        void draw_debug_index_centered(inout vec4 Q, vec2 U, int i, int j) {
+            vec2 p = cpos(i);
+            vec3 a = caxes(j).xyz;
+            mat3 t = transform(a);
+            p = (inverse(t) * vec3(p, 1)).xy;
+            p = to_screen_space(p, R);
+            draw_debug_point(Q, U, p, vec3(1));
+        }
+        
+        void draw_debug_index_transformed(inout vec4 Q, vec2 U, int i, int j, int k) {
+            vec2 p = cpos(i);
+            
+            vec3 aj = caxes(j).xyz;
+            mat3 tj = transform(aj);
+            
+            vec3 ak = caxes(k).xyz;
+            mat3 tk = transform(ak);
+            
+            p = (tk * inverse(tj) * vec3(p, 1)).xy;
+            p = to_screen_space(p, R);
+            draw_debug_point(Q, U, p, vec3(1));
+        }
+        
+        float df_line(vec2 p, in vec2 a, in vec2 b)
+        {
+            vec2 pa = p - a, ba = b - a;
+            float h = clamp(dot(pa,ba) / dot(ba,ba), 0., 1.);	
+            return length(pa - ba * h);
+        }
+        
+        // Catmull-rom interpolation taken from https://www.shadertoy.com/view/Mt2GWd
+        vec2 catrom_interp(vec2 a, vec2 b, vec2 c, vec2 d, float p)
+        {
+            // CatmullRoms are cardinals with a tension of 0.5
+            vec2 P = -a + (3. * (b - c)) + d;
+            vec2 Q = (2. * a) - (5. * b) + (4. * c) - d;
+            vec2 L = c - a;
+            vec2 S = 2. * b;
+        
+            float p2 = p * p;
+            float p3 = p * p2;
+        
+            return .5 * ((P * p3) + (Q * p2) + (L * p) + S);
+        }
+        
+        #define CATROM_STEPS 5.
+        float df_catrom(vec2 p, vec2 a, vec2 b, vec2 c, vec2 d)
+        { 
+            float e = 1.;
+            for (float i = 0.; i < CATROM_STEPS; ++i)
+            {
+                vec2 p0 = catrom_interp(a, b, c, d, (i   ) / CATROM_STEPS);
+                vec2 p1 = catrom_interp(a, b, c, d, (i+1.) / CATROM_STEPS);
+                e = min(e, df_line(p, p0, p1));
+            }
+                        
+            return e;
+        }
+        
+        void draw_catrom_border(inout vec4 Q, vec2 p, int start, float width, vec3 color, inout float mask, inout float mask2) {
+            float border_mask = 0., df = 1.;
+            vec2 a, b = cpos(start+N-3), c = cpos(start+N-2), d = cpos(start+N-1);
+            for (int i = 0; i < N; i++) {
+                a = b;
+                b = c;
+                c = d;
+                d = cpos(start+i);
+                df = min(df, df_catrom(p, a, b, c, d));
+            }
+            border_mask = smoothstep(width+r, width, df);
+            Q.rgb = mix(Q.rgb, color, border_mask);
+            mask  = mix(mask,  0., border_mask);
+            mask2 = mix(mask2, 0., border_mask);
+        }
+        
+        void draw_border(inout vec4 Q, vec2 p, vec2[N] points) {
+            for (int i = 0; i < N; i++) {
+                float df = df_line(p, points[i], points[next(i)]);
+                Q += smoothstep(0.01+r, 0.01, df);
+            }
+        }
+        
+        // Ellipse SDF adapted from https://iquilezles.org/articles/distfunctions2d/
+        float sdEllipse( in vec2 p, in vec2 center, in vec2 facing, float width, float height ) {
+            p = p - center;
+            facing = normalize(facing - center);
+            facing = facing.yx;
+            p = vec2(p.x * facing.x - p.y * facing.y, p.x * facing.t + p.y * facing.x);
+            
+            vec2 ab = vec2(height, width);
+            p = abs(p); if( p.x > p.y ) {p=p.yx;ab=ab.yx;}
+            float l = ab.y*ab.y - ab.x*ab.x;
+            float m = ab.x*p.x/l;      float m2 = m*m; 
+            float n = ab.y*p.y/l;      float n2 = n*n; 
+            float c = (m2+n2-1.0)/3.0; float c3 = c*c*c;
+            float q = c3 + m2*n2*2.0;
+            float d = c3 + m2*n2;
+            float g = m + m*n2;
+            float co;
+            if( d<0.0 )
+            {
+                float h = acos(q/c3)/3.0;
+                float s = cos(h);
+                float t = sin(h)*sqrt(3.0);
+                float rx = sqrt( -c*(s + t + 2.0) + m2 );
+                float ry = sqrt( -c*(s - t + 2.0) + m2 );
+                co = (ry+sign(l)*rx+abs(g)/(rx*ry)- m)/2.0;
+            }
+            else
+            {
+                float h = 2.0*m*n*sqrt( d );
+                float s = sign(q+h)*pow(abs(q+h), 1.0/3.0);
+                float u = sign(q-h)*pow(abs(q-h), 1.0/3.0);
+                float rx = -s - u - c*4.0 + 2.0*m2;
+                float ry = (s - u)*sqrt(3.0);
+                float rm = sqrt( rx*rx + ry*ry );
+                co = (ry/sqrt(rm-rx)+2.0*g/rm-m)/2.0;
+            }
+            vec2 r = ab * vec2(co, sqrt(1.0-co*co));
+            
+            float dist = length(r-p) * sign(p.y-r.y);
+            return dist;
+        }
+        
+        float sdParabola( in vec2 pos, in float k )
+        {
+            pos.x = abs(pos.x);
+            float ik = 1.0/k;
+            float p = ik*(pos.y - 0.5*ik)/3.0;
+            float q = 0.25*ik*ik*pos.x;
+            float h = q*q - p*p*p;
+            float r = sqrt(abs(h));
+            float x = (h>0.0) ? 
+                pow(q+r,1.0/3.0) - pow(abs(q-r),1.0/3.0)*sign(r-q) :
+                2.0*cos(atan(r,q)/3.0)*sqrt(p);
+            return length(pos-vec2(x,k*x*x)) * sign(pos.x-x);
+        }
+        
+        float sdTriangleIsosceles( in vec2 p, in vec2 q )
+        {
+            p.x = abs(p.x);
+            vec2 a = p - q*clamp( dot(p,q)/dot(q,q), 0.0, 1.0 );
+            vec2 b = p - q*vec2( clamp( p.x/q.x, 0.0, 1.0 ), 1.0 );
+            float s = -sign( q.y );
+            vec2 d = min( vec2( dot(a,a), s*(p.x*q.y-p.y*q.x) ),
+                          vec2( dot(b,b), s*(p.y-q.y)  ));
+            return -sqrt(d.x)*sign(d.y);
+        }
+        
+        float sdSegment( in vec2 p, in vec2 a, in vec2 b )
+        {
+            vec2 pa = p-a, ba = b-a;
+            float h = clamp( dot(pa,ba)/dot(ba,ba), 0.0, 1.0 );
+            return length( pa - ba*h );
+        }
+        
+        // Polygon SDF from https://iquilezles.org/articles/distfunctions2d/
+        float sdfBody(vec2 p, int start)
+        {
+            float d = dot(p-cpos(start),p-cpos(start));
+            float s = 1.0;
+            for( int i=start, j=start+N-1; i<start+N; j=i, i++ )
+            {
+                vec2 e = cpos(j) - cpos(i);
+                vec2 w =       p - cpos(i);
+                vec2 b = w - e*clamp( dot(w,e)/dot(e,e), 0.0, 1.0 );
+                d = min( d, dot(b,b) );
+                bvec3 c = bvec3(
+                    p.y>=cpos(i).y,
+                    p.y<cpos(j).y,
+                    e.x*w.y>e.y*w.x);
+                if( all(c) || all(not(c)) ) s*=-1.0;  
+            }
+            return s*sqrt(d);
+        }
+        
+        float tan_half_angle(vec2 A, vec2 B)
+        {
+            float a = cross2(A, B), b = dot(A,B);
+            return a / (sqrt(a * a + b * b) + b);
+        }
+        
+        const float FRECKLE_RADIUS = 0.1;
+        const float FRECKLE_SIZE = 0.03;
+        float sdFreckles(vec2 uv) {
+            float d = distance(uv, FRECKLE_RADIUS*vec2(0, -1)) - FRECKLE_SIZE;
+            d = merge(d, distance(uv, FRECKLE_RADIUS*vec2(cos(TAU/12.), sin(TAU/12.))) - FRECKLE_SIZE);
+            d = merge(d, distance(uv, FRECKLE_RADIUS*vec2(cos(5.*TAU/12.), sin(5.*TAU/12.))) - FRECKLE_SIZE);
+            return d;
+        }
+        
+        const float HEAD_SHADOW_AMP = 0.4;
+        const float HEAD_SHADOW_PER = 1.5;
+        const float HEAD_SHADOW_OFF = -0.1;
+        const float HEAD_SHADOW_LIGHT_OFF = 0.12;
+        const float FRECKLE_OFF = 0.3;
+        const float EYE_SIDE_OFF = -0.52;
+        const float EYE_HEIGHT_OFF = -0.1;
+        const float EYE_HEIGHT = 0.24;
+        const float EYE_WIDTH = 0.16;
+        const float PUPIL_HEIGHT = 0.08;
+        const float PUPIL_WIDTH = 0.07;
+        const float PUPIL_OFF_Y = -0.1;
+        const float NOSE_OFF_Y = 0.01;
+        const float NOSE_SHADOW_OFF = 0.3;
+        const float HEAD_OBJECT_BORDER = 0.04;
+        
+        #define ss(d) smoothstep(0., r, d)
+        #define head_shadow(off) (-cos(uv.x*HEAD_SHADOW_PER)*HEAD_SHADOW_AMP - uv.y+off)
+        
+        void mouth_color(inout vec3 col, vec2 uv) {
+            uv.x = abs(uv.x);
+            col = mix(col, EYES_COLOR, ss(0.08-length(vec2(max(0., uv.x - .15), 2.*uv.y + uv.x + 0.68))));
+        }
+        float draw_face(inout vec4 Q, vec2 uv, float d)
+        {
+            vec3 res = HEAD_COLOR;
+            // Head shadow
+            res = mix(res, HEAD_SHADOW_LIGHT_COLOR, ss(head_shadow(HEAD_SHADOW_OFF+HEAD_SHADOW_LIGHT_OFF)));
+            res = mix(res, HEAD_SHADOW_COLOR, ss(head_shadow(HEAD_SHADOW_OFF)));
+            // Mouth
+            mouth_color(res, uv);
+            uv.x = abs(uv.x);
+            // Freckles
+            res = mix(res, HEAD_BORDER_COLOR, ss(-sdFreckles(uv+vec2(EYE_SIDE_OFF,FRECKLE_OFF))));
+            float nose_sd = -sdEllipse(uv+vec2(0,NOSE_OFF_Y), vec2(0, 0), vec2(0, 1), 0.2, 0.25);
+            res = mix(res, NOSE_BORDER_COLOR, smoothstep(-HEAD_OBJECT_BORDER, -HEAD_OBJECT_BORDER+r, nose_sd));
+            // Nose
+            res = mix(res, NOSE_COLOR, ss(nose_sd));
+            res = mix(res, NOSE_SHADOW_LIGHT_COLOR, ss(nose_sd)*ss(head_shadow(NOSE_SHADOW_OFF+HEAD_SHADOW_LIGHT_OFF)));
+            res = mix(res, NOSE_SHADOW_COLOR, ss(nose_sd)*ss(head_shadow(NOSE_SHADOW_OFF)));
+            // Eyes
+            float sd_eye = -sdEllipse(uv+vec2(EYE_SIDE_OFF,EYE_HEIGHT_OFF), vec2(0, 0), vec2(0, 1), EYE_HEIGHT, EYE_WIDTH);
+            res = mix(res, HEAD_BORDER_COLOR, smoothstep(-HEAD_OBJECT_BORDER, -HEAD_OBJECT_BORDER+r, sd_eye));
+            res = mix(res, EYES_COLOR, ss(sd_eye));
+            res = mix(res, vec3(1), ss(-sdEllipse(uv+vec2(EYE_SIDE_OFF,EYE_HEIGHT_OFF+PUPIL_OFF_Y), vec2(0, 0), vec2(0, 1), PUPIL_HEIGHT, PUPIL_WIDTH)));
+            
+            float head_mask = smoothstep(r, 0., d);
+            Q.rgb = mix(Q.rgb, res, head_mask);
+            return head_mask;
+        }
+        
+        const float BODY_SHADOW_AMP = 0.4;
+        const float BODY_SHADOW_PER = 1.3;
+        const float BODY_SHADOW_OFF_TOP = -0.3;
+        const float BODY_SHADOW_OFF_BOT = -0.6;
+        const float BODY_SHADOW_LIGHT_OFF = 0.08;
+        const float BODY_SHADOW_OFF_FEET = 0.7;
+        void draw_body(inout vec4 Q, vec2 uv, inout float body_mask, inout float shell_mask, inout float blue_mask)
+        {
+            float feet_shadow_mask =       ss(+cos(uv.x*BODY_SHADOW_PER)*BODY_SHADOW_AMP + uv.y+BODY_SHADOW_OFF_FEET);
+            float feet_shadow_light_mask = ss(+cos(uv.x*BODY_SHADOW_PER)*BODY_SHADOW_AMP + uv.y+BODY_SHADOW_OFF_FEET + BODY_SHADOW_LIGHT_OFF);
+            float bot_shadow_mask =        ss(-cos(uv.x*BODY_SHADOW_PER)*BODY_SHADOW_AMP - uv.y+BODY_SHADOW_OFF_TOP);
+            float bot_shadow_light_mask =  ss(-cos(uv.x*BODY_SHADOW_PER)*BODY_SHADOW_AMP - uv.y+BODY_SHADOW_OFF_TOP + BODY_SHADOW_LIGHT_OFF);
+            float top_shadow_mask =        ss(+cos(uv.x*BODY_SHADOW_PER)*BODY_SHADOW_AMP + uv.y+BODY_SHADOW_OFF_BOT);
+            float top_shadow_light_mask =  ss(+cos(uv.x*BODY_SHADOW_PER)*BODY_SHADOW_AMP + uv.y+BODY_SHADOW_OFF_BOT + BODY_SHADOW_LIGHT_OFF);
+          
+            Q.rgb = mix(Q.rgb, BLUE_SHADOW_LIGHT_COLOR, blue_mask * feet_shadow_light_mask);
+            Q.rgb = mix(Q.rgb, BLUE_SHADOW_COLOR, blue_mask * feet_shadow_mask);
+                    
+            Q.rgb = mix(Q.rgb, BODY_SHADOW_LIGHT_COLOR, body_mask * bot_shadow_light_mask);
+            Q.rgb = mix(Q.rgb, SHELL_SHADOW_LIGHT_COLOR, shell_mask * bot_shadow_light_mask);
+            
+            Q.rgb = mix(Q.rgb, BODY_SHADOW_COLOR, body_mask * bot_shadow_mask);
+            Q.rgb = mix(Q.rgb, SHELL_SHADOW_COLOR, shell_mask * bot_shadow_mask);
+            
+            Q.rgb = mix(Q.rgb, BODY_SHADOW_LIGHT_COLOR, body_mask * top_shadow_light_mask);
+            Q.rgb = mix(Q.rgb, SHELL_SHADOW_LIGHT_COLOR, shell_mask * top_shadow_light_mask);
+            
+            Q.rgb = mix(Q.rgb, BODY_SHADOW_COLOR, body_mask * top_shadow_mask);
+            Q.rgb = mix(Q.rgb, SHELL_SHADOW_COLOR, shell_mask * top_shadow_mask);
+        }
+        
+        #define SQUISH 0.02
+        void draw_bubble(
+            inout vec4 Q, 
+            vec2 uv, 
+            vec2 center,
+            vec2 p, 
+            float radius, 
+            float border_radius,
+            inout float mask
+            ) {
+            radius = 0.5 * radius;
+            float l = sdEllipse(uv, p, center, radius, radius + SQUISH);
+            
+            float body_mask = smoothstep(radius+r, radius, l);
+            Q.rgb = mix(Q.rgb, BODY_COLOR, body_mask);
+            float border_mask = (1.-mask) * smoothstep(border_radius+r, border_radius, abs(radius-l));
+            Q.rgb = mix(Q.rgb, BODY_BORDER_COLOR, border_mask);
+            
+            mask += body_mask - border_mask;
+            mask = clamp(mask, 0., 1.);
+        }
+        
+        // Polygon uv function adapted from https://www.shadertoy.com/view/McKcDG
+        vec2 softbody_uv(vec2 p, int start) {
+            float[N] weights;
+            vec2 vi, vj, vk, uv;
+            float tot = 0.;
+            
+            for(int i = 0; i < N; i++)
+            {
+                vi = cpos(start+prev(i)) - p;
+                vj = cpos(start+i) - p;
+                vk = cpos(start+prev(prev(i))) - p;
+                float angle_ji = 
+                weights[prev(i)] = 
+                    (tan_half_angle(vj, vi) + tan_half_angle(vi, vk)) 
+                    / length(vi);
+                tot += weights[prev(i)];
+            }
+            
+            for(int i = 0; i < N; i++) {
+                weights[i] /= tot;
+                float theta = float(i) * TAU / float(N);
+                uv += weights[i] * vec2(cos(theta), sin(theta));
+            }
+            return uv;
+        }
+        
+        const float SHELL_WIDTH = 0.35;
+        const float SHELL_MID = 0.1;
+        const float HANDLE_WIDTH = 0.18;
+        const float HANDLE_OFF = -0.08;
+        const float HANDLE_HEIGHT = 0.1;
+        const float LINES_OFF_X = 0.18;
+        const float LINES_OFF_Y = -0.23;
+        float draw_shell( inout vec4 Q, vec2 uv, inout float shell_mask) {
+            uv.y *= -1.;
+            float dtop = sdEllipse(uv, vec2(0,SHELL_MID), vec2(0,1), 0.33, SHELL_WIDTH);
+            float dbot = sdEllipse(uv, vec2(0,SHELL_MID), vec2(0,1), 0.15, SHELL_WIDTH);
+            float dline = uv.y - SHELL_MID;
+            
+            float sbot = sdEllipse(uv, vec2(0,HANDLE_OFF), vec2(0,1), HANDLE_HEIGHT, HANDLE_WIDTH);
+            float sline = sq(uv.y + LINES_OFF_Y) - (-abs(uv.x) + LINES_OFF_X); 
+            
+            float d = round_merge(-dline, dbot, 0.);
+            d = intersect(d, dtop);
+            
+            float lines = -abs(sline) * 1.5;
+            d = intersect(d, lines);
+            
+            d = round_merge(d, sbot, 0.01);
+        
+            float shell_border_mask = smoothstep(0.+r, 0., d);
+            Q.rgb = mix(Q.rgb, SHELL_BORDER_COLOR, shell_border_mask);
+            shell_mask = smoothstep(-0.05+r, -0.05, d);
+            Q.rgb = mix(Q.rgb, SHELL_COLOR, shell_mask);
+            
+            return max(shell_border_mask, shell_mask);
+        }
+        
+        void draw_body_bubbles(
+            inout vec4 Q, 
+            vec2 uv, 
+            inout float body_mask) {
+            vec2 p = cpos(BODY_START+2);
+            vec2 n = cpos(BODY_START+3)-cpos(BODY_START+1);
+            n = p + vec2(-n.y, n.x);
+            
+            draw_bubble(Q, uv, n, p, 0.08, 0.01, body_mask);
+            
+            p = cpos(BODY_START+8);
+            n = cpos(BODY_START+7)-cpos(BODY_START+9);
+            
+            n = p + vec2(-n.y, n.x);
+            draw_bubble(Q, uv, n, p, 0.08, 0.01, body_mask);
+        }
+        
+        void draw_head_bubbles(
+            inout vec4 Q, 
+            vec2 uv, 
+            vec2 head_center,
+            inout float body_mask) {
+            
+            draw_bubble(Q, uv, head_center, mid(HEAD_START, 12, 13)-vec2(0, 0.02), 0.11, 0.015, body_mask);
+            draw_bubble(Q, uv, head_center, cpos(HEAD_START+14), 0.09, 0.015, body_mask);
+            draw_bubble(Q, uv, head_center, cpos(HEAD_START+16), 0.09, 0.015, body_mask);
+            draw_bubble(Q, uv, head_center, mid(HEAD_START, 17, 18)-vec2(0, 0.02), 0.11, 0.015, body_mask);  
+        }
+        
+        const float EAR_HEIGHT_OFF = 0.14;
+        const float EAR_SIDE_OFF = 0.1;
+        void draw_ear(inout vec4 Q, vec2 uv) {
+            float a = sdParabola(uv.yx*vec2(1.2,0.5) +vec2(EAR_HEIGHT_OFF,EAR_SIDE_OFF), 1.);
+            float b = sdParabola(uv.yx*vec2(1.2,-0.5)+vec2(EAR_HEIGHT_OFF,EAR_SIDE_OFF), 1.);
+            float c = sdParabola(uv.xy*vec2(1,1)+vec2(0,0.04), 1.);
+            float s = sdParabola(uv.xy*vec2(1,1)+vec2(0,-0.03), 1.);
+            
+            float d = -round_merge(-a,-b,0.04);
+            d = -round_merge(-d,-c,0.04);
+            s = intersect(d, s);
+            
+            Q.rgb = mix(Q.rgb, BLUE_BORDER_COLOR, smoothstep(0.+r, 0., d));
+            Q.rgb = mix(Q.rgb, BLUE_SHADOW_LIGHT_COLOR, smoothstep(-0.015+r, -0.015, d));
+            Q.rgb = mix(Q.rgb, BLUE_COLOR, smoothstep(-0.015+r, -0.015, s));
+        }
+        
+        void draw_foot(inout vec4 Q, vec2 uv, inout float blue_mask) {
+            uv.y *= -1.;
+            vec2 p = vec2(
+                abs(uv.x)+0.8*sq(uv.y-0.05)+(exp(uv.x)-1.)*0.3,
+                uv.y-1.2*sq(uv.x)-0.15) * -1.;
+            float d = sdTriangleIsosceles( p, vec2(0.1, 0.3)) - 0.03;
+        
+            vec2 p2 = vec2(
+                abs(uv.x+0.032 - sq(uv.y+0.14)*1.)-0.038, 
+                uv.y + 0.095 + 0.2*uv.x);
+            float t = length(vec2(max(0., p2.y), p2.x)) + 0.003;
+            d = intersect(d, -abs(t));
+            
+            Q.rgb = mix(Q.rgb, BLUE_BORDER_COLOR, smoothstep(0.+r, 0., d));
+            blue_mask = mix(blue_mask, 1., smoothstep(-0.015+r, -0.015, d));
+            Q.rgb = mix(Q.rgb, BLUE_COLOR, blue_mask);
+            
+        }
+        
+        mat3 get_point_transform(int i, int start) {
+            vec2 p = cpos(start+i);
+            vec2 prev = cpos(start+prev(i));
+            vec2 next = cpos(start+next(i));
+            vec2 s = normalize(next-prev);
+            s = vec2(s.x, -s.y);
+            return transform(p, s);
+        }
+        
+        void draw_ear_at(inout vec4 Q, vec2 uv, int i) {
+            mat3 t = get_point_transform(i, HEAD_START);
+            uv = -(inverse(t) * vec3(uv, 1)).xy;
+            draw_ear(Q, uv);
+        }
+        
+        void draw_foot_at(inout vec4 Q, vec2 uv, int i, inout float blue_mask, bool flip) {
+            mat3 t = get_point_transform(i, BODY_START);
+            uv = -(inverse(t) * vec3(uv, 1)).xy;
+            if (flip) uv.x = -uv.x;
+            draw_foot(Q, uv, blue_mask);
+        }
+        
+        void draw_arm(inout vec4 Q, vec2 uv, vec2 p1, vec2 p2) {
+            vec2 arm = normalize(p2 - p1); 
+            float l = dot(uv - p1, arm);
+            float sd_arm = 0.075-sq(l*4.-0.8)*0.1-sdSegment(uv, p1, p2);
+            Q.rgb = mix(Q.rgb, HEAD_BORDER_COLOR, smoothstep(-HEAD_OBJECT_BORDER, -HEAD_OBJECT_BORDER+r, sd_arm));
+            Q.rgb = mix(Q.rgb, vec3(1), ss(sd_arm));
+        }
+        
+        void draw_character(inout vec4 Q, vec2 uv) {
+            vec2 head_center = center(HEAD_START, iChannel0);
+
+            float dbody = sdfBody(uv, BODY_START);
+            if (dbody > 0.65) return;
+            float dhead = sdfBody(uv, HEAD_START);
+
+            bool body = dbody <= 0.;
+            bool head = dhead <= 0.;
+
+            float blue_mask = 0.;
+            float body_mask = 0.;
+            float shell_mask = 0.;
+            float m = 0.;
+
+            draw_foot_at(Q, uv, 13, blue_mask, false);
+            draw_foot_at(Q, uv, 17, blue_mask, true);
+
+            body_mask = smoothstep(0.+r, 0., dbody);
+            Q.rgb = mix(Q.rgb, BODY_COLOR, body_mask);
+            blue_mask = mix(blue_mask, 0., body_mask);
+
+            if (abs(dbody) < 0.05) 
+            draw_catrom_border(Q, uv, BODY_START, 0.015, BODY_BORDER_COLOR, body_mask, blue_mask);
+
+            draw_body_bubbles(Q, uv, body_mask);
+
+            vec2 head_uv = softbody_uv(uv, HEAD_START);
+            m = draw_face(Q, head_uv, dhead);
+            body_mask = mix(body_mask, 0., m);
+            blue_mask = mix(blue_mask, 0., m);
+
+            if (abs(dhead) < 0.05) 
+            draw_catrom_border(Q, uv, HEAD_START, 0.015, HEAD_BORDER_COLOR, body_mask, blue_mask);
+
+            draw_head_bubbles(Q, uv, head_center, body_mask);
+
+            float a = caxes(N).z;
+            vec2 shell_avp_pos = vec2(0);
+            shell_avp_pos += cpos(BODY_START);
+            shell_avp_pos += cpos(BODY_START+10);
+            shell_avp_pos += cpos(BODY_START+15)*2.5;
+            shell_avp_pos /= 4.5;
+            mat3 t = transform(shell_avp_pos, a);
+            vec2 body_fixed_uv = -(inverse(t) * vec3(uv, 1)).xy * 2.;
+            m = draw_shell(Q, body_fixed_uv, shell_mask);
+            body_mask = mix(body_mask, 0., m);
+            blue_mask = mix(blue_mask, 0., m);
+
+            vec2 body_uv = softbody_uv(uv, BODY_START);
+            if (body_mask > 0. || shell_mask > 0. || blue_mask > 0.) draw_body(Q, body_uv, body_mask, shell_mask, blue_mask);
+
+            draw_ear_at(Q, uv, 2);
+            draw_ear_at(Q, uv, 8);
+
+            draw_arm(Q, uv, cpos(ARM_RIGHT), ARM_RIGHT_TARGET);
+            draw_arm(Q, uv, cpos(ARM_LEFT), ARM_LEFT_TARGET);
+
+            return;
+        }
+
+        // From https://github.com/hughsk/glsl-hsv2rgb/blob/master/index.glsl
+        vec3 hsv2rgb(vec3 c) {
+            vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+            vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+            return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+        }
+
+        #define WAVE_STEPS 6.
+        #define WAVE_SPEED 0.6
+        #define WAVE_INTENSITY_CHANGE 0.3
+        void draw_wave(inout vec4 Q, in vec2 uv, in float mult) {
+            uv.x += mult*iTime*WAVE_SPEED;
+            float wave = 0.3*sin(uv.x  * 7.) - uv.y;
+            wave += sin(uv.x *3.)*0.2*cos(uv.x );
+            wave -= 0.3*uv.y;
+            wave = abs(wave);
+            vec3 col = vec3(1.7 + (WAVE_INTENSITY_CHANGE*sin(iTime)));
+            for (float i = WAVE_STEPS-1.; i >= 0.; i--) {
+                float n = (i/WAVE_STEPS);
+                float s = atan((n-0.2)*4.)/PI+0.5+0.3;
+                float d = smoothstep(s+r, s, wave)*(1./WAVE_STEPS);
+                d = d*d;
+                Q.rgb = mix(Q.rgb, col, d);
+            }  
+        }
+        void mainImage( out vec4 Q, in vec2 U ) {
+            Q = vec4(0, 0, 0, 1);
+            
+            vec2 uv = to_world_space(U, R);
+            
+            float h = 0.5+0.5*cos(iTime*0.4);
+            float v = 0.9+0.1*sin(iTime*0.1);
+            Q.rgb = hsv2rgb(vec3(h, 0.6, v));
+            
+            draw_wave(Q, uv, 1.);
+            draw_wave(Q, uv, -1.);
+            
+            draw_character(Q, uv);
+            
+            Q = Q;
+            
+        }
+
+    </script>
+    <script src="main.js"></script>
+</head>
+<body onload="init()" style="margin: 0"></body>
+</html>
